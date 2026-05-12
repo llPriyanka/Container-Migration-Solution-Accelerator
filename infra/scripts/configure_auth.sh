@@ -45,7 +45,14 @@ RG_ARG="${1:-}"
 
 load_from_azd() {
     info "Loading azd environment values..."
-    if ! azd_values=$(azd env get-values 2>/dev/null); then
+
+    # Resolve project root (where .azure/ lives) regardless of where the script is invoked from
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local project_root
+    project_root="$(cd "$script_dir/../.." && pwd)"
+
+    if ! azd_values=$(cd "$project_root" && azd env get-values 2>/dev/null); then
         return 1
     fi
 
@@ -131,14 +138,12 @@ for a in apps:
     ok "Discovered API app : $API_APP_NAME ($API_APP_FQDN)"
 }
 
-# Try azd first; if that fails, use the resource-group argument
-if ! load_from_azd; then
-    if [ -n "$RG_ARG" ]; then
-        warn "azd environment not available – falling back to resource group query."
-        load_from_resource_group "$RG_ARG"
-    else
-        fail "Could not load azd environment and no resource group provided.\nUsage: $0 [<resource-group-name>]"
-    fi
+# If a resource group argument is provided, use it directly; otherwise try azd
+if [ -n "$RG_ARG" ]; then
+    info "Resource group argument provided – querying Azure directly."
+    load_from_resource_group "$RG_ARG"
+elif ! load_from_azd; then
+    fail "Could not load azd environment and no resource group provided.\nUsage: $0 [<resource-group-name>]"
 fi
 
 # Validate required values
