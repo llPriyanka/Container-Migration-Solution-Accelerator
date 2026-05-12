@@ -12,6 +12,11 @@ hooks:
     posix:
       shell: sh
       run: |  
+        echo ""
+        echo "🔐 Configuring authentication..."
+        echo "Run the following command to set up authentication:"
+        echo "  bash ./infra/scripts/configure_auth.sh"
+        echo ""
         echo "-----"
         echo "🧭 Web App Details:"
         echo "✅ Name: $CONTAINER_WEB_APP_NAME"
@@ -27,6 +32,11 @@ hooks:
     windows:
       shell: pwsh
       run: |  
+        Write-Host ""
+        Write-Host "🔐 Configuring authentication..." -ForegroundColor Cyan
+        Write-Host "Run the following command to set up authentication:"
+        Write-Host "  pwsh ./infra/scripts/configure_auth.ps1" -ForegroundColor Yellow
+        Write-Host ""
         Write-Host "-----"
         Write-Host "🧭 Web App Details:"
         Write-Host "✅ Name: $env:CONTAINER_WEB_APP_NAME"
