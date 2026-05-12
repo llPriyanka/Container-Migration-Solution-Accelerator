@@ -45,14 +45,7 @@ RG_ARG="${1:-}"
 
 load_from_azd() {
     info "Loading azd environment values..."
-
-    # Resolve project root (where .azure/ lives) regardless of where the script is invoked from
-    local script_dir
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    local project_root
-    project_root="$(cd "$script_dir/../.." && pwd)"
-
-    if ! azd_values=$(cd "$project_root" && azd env get-values 2>/dev/null); then
+    if ! azd_values=$(azd env get-values 2>/dev/null); then
         return 1
     fi
 
@@ -93,39 +86,18 @@ load_from_resource_group() {
     az group show --name "$rg" > /dev/null 2>&1 \
         || fail "Resource group '$rg' not found in subscription $SUBSCRIPTION_ID."
 
-    # List all container apps in the resource group
-    local app_list
-    app_list=$(az containerapp list --resource-group "$rg" --query "[].{name:name, fqdn:properties.configuration.ingress.fqdn}" -o json 2>/dev/null)
+    # Identify the frontend/web app using az JMESPath query (contains 'frontend' or 'web')
+    WEB_APP_NAME=$(az containerapp list --resource-group "$rg" \
+        --query "[?contains(name, 'frontend') || contains(name, 'web')] | [0].name" -o tsv 2>/dev/null)
 
-    local app_count
-    app_count=$(echo "$app_list" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null \
-                || echo "$app_list" | python -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null)
+    # Identify the API/backend app (contains 'api' or 'backend', exclude processor)
+    API_APP_NAME=$(az containerapp list --resource-group "$rg" \
+        --query "[?contains(name, 'api') || contains(name, 'backend')] | [0].name" -o tsv 2>/dev/null)
 
-    [ "$app_count" -ge 2 ] 2>/dev/null \
-        || fail "Expected at least 2 container apps in '$rg', found ${app_count:-0}."
-
-    # Identify the frontend/web app and the API/backend app by name patterns
-    # Patterns: "frontend", "web" → frontend app; "api", "backend" → API app
-    WEB_APP_NAME=$(echo "$app_list" | python3 -c "
-import sys, json
-apps = json.load(sys.stdin)
-for a in apps:
-    n = a['name'].lower()
-    if 'frontend' in n or 'web' in n:
-        print(a['name']); break
-" 2>/dev/null || true)
-
-    API_APP_NAME=$(echo "$app_list" | python3 -c "
-import sys, json
-apps = json.load(sys.stdin)
-for a in apps:
-    n = a['name'].lower()
-    if 'api' in n or 'backend' in n:
-        print(a['name']); break
-" 2>/dev/null || true)
-
-    [ -n "$WEB_APP_NAME" ] || fail "Could not identify frontend/web container app in '$rg'. Expected a name containing 'frontend' or 'web'."
-    [ -n "$API_APP_NAME" ] || fail "Could not identify API/backend container app in '$rg'. Expected a name containing 'api' or 'backend'."
+    [ -n "$WEB_APP_NAME" ] && [ "$WEB_APP_NAME" != "None" ] \
+        || fail "Could not identify frontend/web container app in '$rg'. Expected a name containing 'frontend' or 'web'."
+    [ -n "$API_APP_NAME" ] && [ "$API_APP_NAME" != "None" ] \
+        || fail "Could not identify API/backend container app in '$rg'. Expected a name containing 'api' or 'backend'."
 
     # Fetch FQDNs
     WEB_APP_FQDN=$(az containerapp show --name "$WEB_APP_NAME" --resource-group "$rg" --query "properties.configuration.ingress.fqdn" -o tsv 2>/dev/null)
