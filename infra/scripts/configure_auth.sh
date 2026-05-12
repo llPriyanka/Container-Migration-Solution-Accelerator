@@ -6,6 +6,16 @@
 # Automates Microsoft Entra ID (Azure AD) authentication setup for the
 # Container Migration Solution Accelerator.
 #
+# Usage:
+#   bash ./infra/scripts/configure_auth.sh                       # uses azd environment (.azure folder)
+#   bash ./infra/scripts/configure_auth.sh <resource-group-name> # queries Azure directly by RG
+#
+#   - Use the first form when you have an azd environment provisioned
+#     (i.e. the .azure/ folder exists from running 'azd provision' or 'azd up').
+#   - Use the second form when the .azure/ folder is not present or you want
+#     to target a specific resource group regardless of the azd environment.
+#     If both a resource group argument AND .azure/ exist, the argument takes priority.
+#
 # This script:
 #   1. Creates App Registrations for the Web (frontend) and API (backend) apps
 #   2. Exposes a user_impersonation scope on each registration
@@ -18,7 +28,7 @@
 #
 # Prerequisites:
 #   - Azure CLI (az) installed and logged in
-#   - azd environment provisioned (azd env get-values must return outputs)
+#   - azd environment provisioned OR a resource group with deployed container apps
 #   - Permissions to create App Registrations and manage Container Apps
 # =============================================================================
 
