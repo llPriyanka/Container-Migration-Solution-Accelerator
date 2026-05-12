@@ -39,42 +39,115 @@ ok()    { echo -e "${GREEN}[OK]${NC}    $*"; }
 fail()  { echo -e "${RED}[FAIL]${NC}  $*"; exit 1; }
 
 ###############################################################################
-# Load azd environment values
+# Load environment values – prefer azd, fall back to resource-group query
 ###############################################################################
-info "Loading azd environment values..."
-if ! azd_values=$(azd env get-values 2>/dev/null); then
-    fail "Could not load azd environment. Run 'azd provision' first."
-fi
+RG_ARG="${1:-}"
 
-get_azd_value() {
-    local key="$1"
-    local val
-    val=$(echo "$azd_values" | grep "^${key}=" | head -1 | sed "s/^${key}=\"\?\(.*\)\"\?$/\1/" | tr -d '"')
-    echo "$val"
+load_from_azd() {
+    info "Loading azd environment values..."
+    if ! azd_values=$(azd env get-values 2>/dev/null); then
+        return 1
+    fi
+
+    get_azd_value() {
+        local key="$1"
+        local val
+        val=$(echo "$azd_values" | grep "^${key}=" | head -1 | sed "s/^${key}=\"\?\(.*\)\"\?$/\1/" | tr -d '"')
+        echo "$val"
+    }
+
+    SUBSCRIPTION_ID=$(get_azd_value "AZURE_SUBSCRIPTION_ID")
+    RESOURCE_GROUP=$(get_azd_value "AZURE_RESOURCE_GROUP")
+    WEB_APP_NAME=$(get_azd_value "CONTAINER_WEB_APP_NAME")
+    API_APP_NAME=$(get_azd_value "CONTAINER_API_APP_NAME")
+    WEB_APP_FQDN=$(get_azd_value "CONTAINER_WEB_APP_FQDN")
+    API_APP_FQDN=$(get_azd_value "CONTAINER_API_APP_FQDN")
+
+    # Fallback: try CONTAINER_FRONTEND_APP_NAME (azure_custom.yaml uses this)
+    if [ -z "$WEB_APP_NAME" ]; then
+        WEB_APP_NAME=$(get_azd_value "CONTAINER_FRONTEND_APP_NAME")
+    fi
+    if [ -z "$WEB_APP_FQDN" ]; then
+        WEB_APP_FQDN=$(get_azd_value "CONTAINER_FRONTEND_APP_FQDN")
+    fi
+
+    # Return success only if we got the critical values
+    [ -n "$SUBSCRIPTION_ID" ] && [ -n "$RESOURCE_GROUP" ] && [ -n "$WEB_APP_NAME" ] && [ -n "$API_APP_NAME" ]
 }
 
-SUBSCRIPTION_ID=$(get_azd_value "AZURE_SUBSCRIPTION_ID")
-RESOURCE_GROUP=$(get_azd_value "AZURE_RESOURCE_GROUP")
-WEB_APP_NAME=$(get_azd_value "CONTAINER_WEB_APP_NAME")
-API_APP_NAME=$(get_azd_value "CONTAINER_API_APP_NAME")
-WEB_APP_FQDN=$(get_azd_value "CONTAINER_WEB_APP_FQDN")
-API_APP_FQDN=$(get_azd_value "CONTAINER_API_APP_FQDN")
+load_from_resource_group() {
+    local rg="$1"
+    info "Fetching details from resource group: $rg"
 
-# Fallback: try CONTAINER_FRONTEND_APP_NAME (azure_custom.yaml uses this)
-if [ -z "$WEB_APP_NAME" ]; then
-    WEB_APP_NAME=$(get_azd_value "CONTAINER_FRONTEND_APP_NAME")
-fi
-if [ -z "$WEB_APP_FQDN" ]; then
-    WEB_APP_FQDN=$(get_azd_value "CONTAINER_FRONTEND_APP_FQDN")
+    SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+    RESOURCE_GROUP="$rg"
+
+    # Verify the resource group exists
+    az group show --name "$rg" > /dev/null 2>&1 \
+        || fail "Resource group '$rg' not found in subscription $SUBSCRIPTION_ID."
+
+    # List all container apps in the resource group
+    local app_list
+    app_list=$(az containerapp list --resource-group "$rg" --query "[].{name:name, fqdn:properties.configuration.ingress.fqdn}" -o json 2>/dev/null)
+
+    local app_count
+    app_count=$(echo "$app_list" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null \
+                || echo "$app_list" | python -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null)
+
+    [ "$app_count" -ge 2 ] 2>/dev/null \
+        || fail "Expected at least 2 container apps in '$rg', found ${app_count:-0}."
+
+    # Identify the frontend/web app and the API/backend app by name patterns
+    # Patterns: "frontend", "web" → frontend app; "api", "backend" → API app
+    WEB_APP_NAME=$(echo "$app_list" | python3 -c "
+import sys, json
+apps = json.load(sys.stdin)
+for a in apps:
+    n = a['name'].lower()
+    if 'frontend' in n or 'web' in n:
+        print(a['name']); break
+" 2>/dev/null || true)
+
+    API_APP_NAME=$(echo "$app_list" | python3 -c "
+import sys, json
+apps = json.load(sys.stdin)
+for a in apps:
+    n = a['name'].lower()
+    if 'api' in n or 'backend' in n:
+        print(a['name']); break
+" 2>/dev/null || true)
+
+    [ -n "$WEB_APP_NAME" ] || fail "Could not identify frontend/web container app in '$rg'. Expected a name containing 'frontend' or 'web'."
+    [ -n "$API_APP_NAME" ] || fail "Could not identify API/backend container app in '$rg'. Expected a name containing 'api' or 'backend'."
+
+    # Fetch FQDNs
+    WEB_APP_FQDN=$(az containerapp show --name "$WEB_APP_NAME" --resource-group "$rg" --query "properties.configuration.ingress.fqdn" -o tsv 2>/dev/null)
+    API_APP_FQDN=$(az containerapp show --name "$API_APP_NAME" --resource-group "$rg" --query "properties.configuration.ingress.fqdn" -o tsv 2>/dev/null)
+
+    [ -n "$WEB_APP_FQDN" ] || fail "Could not get FQDN for container app '$WEB_APP_NAME'."
+    [ -n "$API_APP_FQDN" ] || fail "Could not get FQDN for container app '$API_APP_NAME'."
+
+    ok "Discovered Web app : $WEB_APP_NAME ($WEB_APP_FQDN)"
+    ok "Discovered API app : $API_APP_NAME ($API_APP_FQDN)"
+}
+
+# Try azd first; if that fails, use the resource-group argument
+if ! load_from_azd; then
+    if [ -n "$RG_ARG" ]; then
+        warn "azd environment not available – falling back to resource group query."
+        load_from_resource_group "$RG_ARG"
+    else
+        fail "Could not load azd environment and no resource group provided.\nUsage: $0 [<resource-group-name>]"
+    fi
 fi
 
 # Validate required values
-[ -z "$SUBSCRIPTION_ID" ] && fail "AZURE_SUBSCRIPTION_ID not found in azd env."
-[ -z "$RESOURCE_GROUP" ]  && fail "AZURE_RESOURCE_GROUP not found in azd env."
-[ -z "$WEB_APP_NAME" ]    && fail "CONTAINER_WEB_APP_NAME / CONTAINER_FRONTEND_APP_NAME not found in azd env."
-[ -z "$API_APP_NAME" ]    && fail "CONTAINER_API_APP_NAME not found in azd env."
-[ -z "$WEB_APP_FQDN" ]    && fail "CONTAINER_WEB_APP_FQDN / CONTAINER_FRONTEND_APP_FQDN not found in azd env."
-[ -z "$API_APP_FQDN" ]    && fail "CONTAINER_API_APP_FQDN / CONTAINER_FRONTEND_APP_FQDN not found in azd env."
+[ -z "$SUBSCRIPTION_ID" ] && fail "AZURE_SUBSCRIPTION_ID could not be determined."
+[ -z "$RESOURCE_GROUP" ]  && fail "AZURE_RESOURCE_GROUP could not be determined."
+[ -z "$WEB_APP_NAME" ]    && fail "Frontend/Web container app name could not be determined."
+[ -z "$API_APP_NAME" ]    && fail "API/Backend container app name could not be determined."
+[ -z "$WEB_APP_FQDN" ]    && fail "Frontend/Web container app FQDN could not be determined."
+[ -z "$API_APP_FQDN" ]    && fail "API/Backend container app FQDN could not be determined."
 
 WEB_APP_URL="https://${WEB_APP_FQDN}"
 API_APP_URL="https://${API_APP_FQDN}"

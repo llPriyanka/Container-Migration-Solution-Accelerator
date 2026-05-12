@@ -35,7 +35,7 @@ hooks:
         Write-Host ""
         Write-Host "🔐 Configuring authentication..." -ForegroundColor Cyan
         Write-Host "Run the following command to set up authentication:"
-        Write-Host "  pwsh ./infra/scripts/configure_auth.ps1" -ForegroundColor Yellow
+        Write-Host "  bash ./infra/scripts/configure_auth.sh" -ForegroundColor Yellow
         Write-Host ""
         Write-Host "-----"
         Write-Host "🧭 Web App Details:"
