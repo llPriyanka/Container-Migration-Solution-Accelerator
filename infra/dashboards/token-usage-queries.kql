@@ -1,0 +1,155 @@
+// =============================================================================
+// KQL queries — LLM token-usage monitoring (AB#43260)
+//
+// Run these in Application Insights → Logs against the workspace bound to
+// the deployment. The events queried here are emitted by
+// ``src/processor/src/libs/logging/token_usage.py`` at the end of every
+// GroupChatOrchestrator run (one summary + one per agent + one per model).
+//
+// Event names (case-sensitive, must match the constants in
+// libs.logging.token_usage):
+//   - LLMTokenUsageSummary   : one event per workflow run, totals only
+//   - LLMAgentTokenUsage     : one event per agent that produced usage
+//   - LLMModelTokenUsage     : one event per distinct model deployment
+//
+// CustomDimensions (all strings; cast as needed):
+//   team, session_id, process_id, model, agent (per-agent only),
+//   prompt_tokens, completion_tokens, total_tokens, invocations
+//
+// NOTE on user attribution
+// ------------------------
+// We DO NOT stamp user identity (upn / email / oid / user_id) on these
+// events; see the privacy decision documented in the WI. ``session_id``
+// and ``process_id`` are the only fields you can use as a per-job /
+// per-invocation proxy. Use them carefully — they are not user IDs.
+// =============================================================================
+
+
+// -----------------------------------------------------------------------------
+// 1. Overall token-usage rollup (last 7 days)
+//    Single number you can paste in a status update.
+// -----------------------------------------------------------------------------
+customEvents
+| where name == 'LLMTokenUsageSummary'
+| where timestamp > ago(7d)
+| extend prompt_tokens     = toint(customDimensions['prompt_tokens'])
+| extend completion_tokens = toint(customDimensions['completion_tokens'])
+| extend total_tokens      = toint(customDimensions['total_tokens'])
+| summarize
+    Workflows           = count(),
+    TotalPromptTokens   = sum(prompt_tokens),
+    TotalCompletionToks = sum(completion_tokens),
+    TotalTokens         = sum(total_tokens),
+    AvgTokensPerRun     = round(avg(total_tokens), 0)
+
+
+// -----------------------------------------------------------------------------
+// 2. Tokens by team (workflow type)
+//    `team` == GroupChatOrchestrator.name, e.g. analysis_workflow,
+//    design_workflow, convert_workflow, documentation_workflow.
+// -----------------------------------------------------------------------------
+customEvents
+| where name == 'LLMTokenUsageSummary'
+| where timestamp > ago(7d)
+| extend team          = tostring(customDimensions['team'])
+| extend prompt_tokens = toint(customDimensions['prompt_tokens'])
+| extend total_tokens  = toint(customDimensions['total_tokens'])
+| summarize
+    Workflows      = count(),
+    PromptTokens   = sum(prompt_tokens),
+    TotalTokens    = sum(total_tokens),
+    AvgPerWorkflow = round(avg(total_tokens), 0)
+    by Team = team
+| order by TotalTokens desc
+
+
+// -----------------------------------------------------------------------------
+// 3. Top agents by total tokens (last 24h)
+// -----------------------------------------------------------------------------
+customEvents
+| where name == 'LLMAgentTokenUsage'
+| where timestamp > ago(24h)
+| extend agent             = tostring(customDimensions['agent'])
+| extend team              = tostring(customDimensions['team'])
+| extend prompt_tokens     = toint(customDimensions['prompt_tokens'])
+| extend completion_tokens = toint(customDimensions['completion_tokens'])
+| extend total_tokens      = toint(customDimensions['total_tokens'])
+| extend invocations       = toint(customDimensions['invocations'])
+| summarize
+    PromptTokens     = sum(prompt_tokens),
+    CompletionTokens = sum(completion_tokens),
+    TotalTokens      = sum(total_tokens),
+    Invocations      = sum(invocations)
+    by Agent = agent, Team = team
+| order by TotalTokens desc
+| take 20
+
+
+// -----------------------------------------------------------------------------
+// 4. Tokens over time (hourly, stacked by team)
+//    Drop into a line/area chart in App Insights.
+// -----------------------------------------------------------------------------
+customEvents
+| where name == 'LLMTokenUsageSummary'
+| where timestamp > ago(7d)
+| extend team         = tostring(customDimensions['team'])
+| extend total_tokens = toint(customDimensions['total_tokens'])
+| summarize TotalTokens = sum(total_tokens) by bin(timestamp, 1h), team
+| order by timestamp asc
+| render areachart
+
+
+// -----------------------------------------------------------------------------
+// 5. Estimated cost by model (rough — adjust constants for your deployment)
+//
+//    The two `let` constants are placeholders. Edit them to match the
+//    pricing for the model deployments you actually use. Reference values
+//    below are for *list price* GPT-4o text completions and DO NOT include
+//    PTU / commitment discounts.
+//
+//      gpt-4o            $2.50 / 1M input,  $10.00 / 1M output
+//      gpt-4o-mini       $0.15 / 1M input,  $0.60  / 1M output
+//      gpt-4.1           (check Azure OpenAI pricing page for current $)
+//
+//    Output is "approximate $ per day per model". Treat as a trend
+//    signal, not a billing number.
+// -----------------------------------------------------------------------------
+let input_price_per_million  = 2.50;   // USD / 1M prompt tokens
+let output_price_per_million = 10.00;  // USD / 1M completion tokens
+customEvents
+| where name == 'LLMModelTokenUsage'
+| where timestamp > ago(30d)
+| extend model             = tostring(customDimensions['model'])
+| extend prompt_tokens     = toint(customDimensions['prompt_tokens'])
+| extend completion_tokens = toint(customDimensions['completion_tokens'])
+| summarize
+    PromptTokens     = sum(prompt_tokens),
+    CompletionTokens = sum(completion_tokens)
+    by bin(timestamp, 1d), Model = model
+| extend InputCost  = round(PromptTokens     * input_price_per_million  / 1000000.0, 4)
+| extend OutputCost = round(CompletionTokens * output_price_per_million / 1000000.0, 4)
+| extend ApproxCostUSD = InputCost + OutputCost
+| project Day = timestamp, Model, PromptTokens, CompletionTokens, InputCost, OutputCost, ApproxCostUSD
+| order by Day desc, ApproxCostUSD desc
+
+
+// -----------------------------------------------------------------------------
+// 6. Top sessions by total tokens (proxy for "noisiest" jobs)
+//    Use session_id (== process_id, the migration job id) to drill into
+//    individual runs. NOT a user identifier — see header.
+// -----------------------------------------------------------------------------
+customEvents
+| where name == 'LLMTokenUsageSummary'
+| where timestamp > ago(7d)
+| extend session_id   = tostring(customDimensions['session_id'])
+| extend team         = tostring(customDimensions['team'])
+| extend model        = tostring(customDimensions['model'])
+| extend total_tokens = toint(customDimensions['total_tokens'])
+| extend invocations  = toint(customDimensions['invocations'])
+| summarize
+    TotalTokens = sum(total_tokens),
+    LLMCalls    = sum(invocations),
+    Runs        = count()
+    by SessionId = session_id, Team = team, Model = model
+| order by TotalTokens desc
+| take 25
