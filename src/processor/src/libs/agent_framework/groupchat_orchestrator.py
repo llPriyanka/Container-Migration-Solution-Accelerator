@@ -36,6 +36,8 @@ from agent_framework import (
 from mem0 import AsyncMemory
 from pydantic import BaseModel, ValidationError
 
+from libs.logging.token_usage import TokenUsageTracker
+
 logger = logging.getLogger(__name__)
 
 
@@ -273,6 +275,24 @@ class GroupChatOrchestrator(ABC, Generic[TInput, TOutput]):
         # Snapshot of progress_counter at the time we last saw _last_coordinator_selection.
         self._last_coordinator_selection_progress: int = 0
 
+        # Per-workflow LLM token-usage accumulator. Constructed per
+        # `run_stream` call so consecutive runs against the same
+        # orchestrator instance start with clean counters and emit a
+        # fresh summary event each time.
+        self._token_tracker: TokenUsageTracker | None = None
+
+    def _new_token_tracker(self) -> TokenUsageTracker:
+        """Factory hook for the per-run TokenUsageTracker.
+
+        Pulled out as a method so tests can subclass and inject a
+        spy / fake without monkey-patching the import.
+        """
+        return TokenUsageTracker(
+            team=self.name or "",
+            session_id=self.process_id or "",
+            process_id=self.process_id or "",
+        )
+
     def _request_forced_termination(
         self, *, reason: str, termination_type: str
     ) -> None:
@@ -477,6 +497,11 @@ class GroupChatOrchestrator(ABC, Generic[TInput, TOutput]):
         self._tool_call_index.clear()
         self._conversation: list[ChatMessage] = []  # Track conversation during workflow
 
+        # Fresh token-usage tracker per workflow run. Emit happens in
+        # `finally` so we never lose the summary on early-exit paths
+        # (timeouts, forced terminations, raised exceptions).
+        self._token_tracker = self._new_token_tracker()
+
         try:
             # Ensure initialized
             if not self._initialized:
@@ -639,6 +664,19 @@ class GroupChatOrchestrator(ABC, Generic[TInput, TOutput]):
                 await on_workflow_complete(error_result)
 
             return error_result
+        finally:
+            # Emit accumulated LLM token-usage events to Application
+            # Insights exactly once per run, regardless of success /
+            # failure / forced termination. `emit()` is idempotent and
+            # never raises.
+            tracker = self._token_tracker
+            if tracker is not None:
+                try:
+                    tracker.emit()
+                except Exception:
+                    logger.exception(
+                        "[TOKEN] Tracker emit raised unexpectedly; ignoring."
+                    )
 
     async def _handle_agent_update(
         self,
@@ -654,11 +692,32 @@ class GroupChatOrchestrator(ABC, Generic[TInput, TOutput]):
         2. On agent switch, complete previous agent's response
         3. Trigger callback with complete response
         4. Handle tool calls separately from text streaming
+        5. Extract any LLM token-usage info present on the update
         """
         agent_name = self._normalize_executor_id(event.executor_id)
         await self._start_agent_if_needed(agent_name, stream_callback, callback)
         self._append_text_chunk(event)
         await self._process_tool_calls(event, agent_name, stream_callback)
+        self._record_token_usage_if_present(event, agent_name)
+
+    def _record_token_usage_if_present(
+        self, event: AgentRunUpdateEvent, agent_name: str
+    ) -> None:
+        """Forward token-usage from a streaming event into the tracker.
+
+        Defensive: any extraction or accumulation failure is swallowed so
+        a malformed update can never break the workflow loop.
+        """
+        tracker = self._token_tracker
+        if tracker is None:
+            return
+        try:
+            tracker.record(getattr(event, "data", None), agent_name)
+        except Exception:
+            logger.exception(
+                "[TOKEN] Failed to record token usage for agent=%s; continuing.",
+                agent_name,
+            )
 
     def _normalize_executor_id(self, executor_id: str) -> str:
         """Normalize executor id to agent name.
