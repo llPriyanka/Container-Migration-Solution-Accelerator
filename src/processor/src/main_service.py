@@ -23,6 +23,7 @@ from libs.agent_framework.middlewares import (
     LoggingFunctionMiddleware,
 )
 from libs.base.application_base import ApplicationBase
+from libs.logging.bootstrap import configure_azure_monitor_if_enabled
 from services.control_api import ControlApiConfig, ControlApiServer
 from services.process_control import ProcessControlManager
 from services.queue_service import (
@@ -101,6 +102,13 @@ class QueueMigrationServiceApp(ApplicationBase):
         (agent framework helpers, telemetry, process control, and the migration
         processor).
         """
+        # Wire up Azure Monitor / OpenTelemetry BEFORE anything else runs
+        # so that any custom-event emission later in the workflow (notably
+        # the token-usage tracker in libs.logging.token_usage) is exported
+        # to Application Insights. No-op when the connection string env
+        # var is unset — see libs/logging/bootstrap.py.
+        configure_azure_monitor_if_enabled()
+
         logger.info(
             "Application initialized with configuration: %s",
             self.application_context.configuration,

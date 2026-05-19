@@ -17,6 +17,9 @@ fully wired up yet (e.g. application bootstrap before
 ``configure_azure_monitor`` has run).
 """
 
+from libs.logging.bootstrap import (  # noqa: F401
+    configure_azure_monitor_if_enabled,
+)
 from libs.logging.event_utils import (  # noqa: F401
     APP_INSIGHTS_CONN_STRING_ENV,
     reset_unconfigured_warning_for_tests,

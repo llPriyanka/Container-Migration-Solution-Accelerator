@@ -19,6 +19,7 @@ from libs.agent_framework.middlewares import (
     LoggingFunctionMiddleware,
 )
 from libs.base.application_base import ApplicationBase
+from libs.logging.bootstrap import configure_azure_monitor_if_enabled
 from steps.analysis.models.step_param import Analysis_TaskParam
 from steps.migration_processor import MigrationProcessor
 from utils.agent_telemetry import TelemetryManager
@@ -40,6 +41,13 @@ class Application(ApplicationBase):
         Initialize the application.
         This method can be overridden by subclasses to perform any necessary setup.
         """
+        # Wire up Azure Monitor / OpenTelemetry BEFORE anything else runs
+        # so that any custom-event emission later in the workflow (notably
+        # the token-usage tracker in libs.logging.token_usage) is exported
+        # to Application Insights. No-op when the connection string env
+        # var is unset — see libs/logging/bootstrap.py.
+        configure_azure_monitor_if_enabled()
+
         logger.info(
             "Application initialized with configuration: %s",
             self.application_context.configuration,
