@@ -214,15 +214,9 @@ def _looks_like_rate_limit(error: BaseException) -> bool:
 
     # "The model produced invalid content" is a transient error from Azure OpenAI
     # when the model output fails content/schema validation — worth retrying.
-    # "No tool call found" is a 400 error when the conversation has orphaned
-    # function call outputs with no matching tool call request.
     if any(
         s in msg
-        for s in [
-            "model produced invalid content",
-            "invalid content",
-            "no tool call found",
-        ]
+        for s in ["model produced invalid content", "invalid content"]
     ):
         return True
 
@@ -833,7 +827,7 @@ class AzureOpenAIResponseClientWithRetry(AzureOpenAIResponsesClient):
                     try:
                         await close()
                     except Exception:
-                        pass
+                        logger.debug("Best-effort close of response stream failed", exc_info=True)
 
                 # Progressive retry for context-length failures.
                 if (
