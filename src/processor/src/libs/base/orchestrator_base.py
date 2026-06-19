@@ -9,7 +9,7 @@ import re
 from abc import abstractmethod
 from typing import Any, Callable, Generic, MutableMapping, Sequence, TypeVar
 
-from agent_framework import ChatAgent, ManagerSelectionResponse, ToolProtocol
+from agent_framework import Agent
 
 from libs.agent_framework.agent_builder import AgentBuilder
 from libs.agent_framework.agent_framework_helper import ClientType
@@ -18,6 +18,7 @@ from libs.agent_framework.azure_openai_response_retry import RateLimitRetryConfi
 from libs.agent_framework.groupchat_orchestrator import (
     AgentResponse,
     AgentResponseStream,
+    ManagerSelectionResponse,
     OrchestrationResult,
 )
 from libs.agent_framework.qdrant_memory_store import QdrantMemoryStore
@@ -26,6 +27,7 @@ from libs.agent_framework.shared_memory_context_provider import (
 )
 from utils.agent_telemetry import TelemetryManager
 from utils.console_util import format_agent_message
+from utils.token_usage_tracker import TokenUsageTracker
 
 from .agent_base import AgentBase
 
@@ -42,6 +44,7 @@ class OrchestratorBase(AgentBase, Generic[TaskParamT, ResultT]):
         self.initialized = False
         self.memory_store: QdrantMemoryStore | None = None
         self.step_name: str = ""
+        self.token_tracker: TokenUsageTracker | None = None
 
     def is_console_summarization_enabled(self) -> bool:
         """Return True if console summarization (extra LLM call per turn) is enabled.
@@ -60,10 +63,10 @@ class OrchestratorBase(AgentBase, Generic[TaskParamT, ResultT]):
 
     async def initialize(self, process_id: str):
         self.mcp_tools: (
-            ToolProtocol
+            Any
             | Callable[..., Any]
             | MutableMapping[str, Any]
-            | Sequence[ToolProtocol | Callable[..., Any] | MutableMapping[str, Any]]
+            | Sequence[Any | Callable[..., Any] | MutableMapping[str, Any]]
         ) = await self.prepare_mcp_tools()
         self.agentinfos = await self.prepare_agent_infos()
 
@@ -82,6 +85,23 @@ class OrchestratorBase(AgentBase, Generic[TaskParamT, ResultT]):
 
         self.agents = await self.create_agents(self.agentinfos, process_id=process_id)
         self.initialized = True
+
+        # Resolve workflow-level token usage tracker from AppContext (if registered)
+        if self.app_context.is_registered(TokenUsageTracker):
+            try:
+                self.token_tracker = self.app_context.get_service(TokenUsageTracker)
+                # Register model deployment name for all agents so per-model tracking works
+                try:
+                    deployment_name = self.agent_framework_helper.settings.get_service_config(
+                        "default"
+                    ).chat_deployment_name
+                    if deployment_name and self.token_tracker:
+                        for agent_name in (self.agents or {}):
+                            self.token_tracker.set_agent_model(agent_name, deployment_name)
+                except Exception:
+                    logger.debug("Could not register agent-model mapping", exc_info=True)
+            except Exception:
+                self.token_tracker = None
 
     async def flush_agent_memories(self) -> None:
         """Flush buffered memories from all agent context providers.
@@ -130,10 +150,10 @@ class OrchestratorBase(AgentBase, Generic[TaskParamT, ResultT]):
     async def prepare_mcp_tools(
         self,
     ) -> (
-        ToolProtocol
+        Any
         | Callable[..., Any]
         | MutableMapping[str, Any]
-        | Sequence[ToolProtocol | Callable[..., Any] | MutableMapping[str, Any]]
+        | Sequence[Any | Callable[..., Any] | MutableMapping[str, Any]]
     ):
         pass
 
@@ -144,8 +164,8 @@ class OrchestratorBase(AgentBase, Generic[TaskParamT, ResultT]):
 
     async def create_agents(
         self, agent_infos: list[AgentInfo], process_id: str
-    ) -> list[ChatAgent]:
-        agents = dict[str, ChatAgent]()
+    ) -> dict[str, Agent]:
+        agents = dict[str, Agent]()
         agent_client = await self.get_client(thread_id=process_id)
 
         # Workspace context — injected into every agent's system instructions
@@ -183,7 +203,7 @@ class OrchestratorBase(AgentBase, Generic[TaskParamT, ResultT]):
                     builder
                     .with_temperature(0.0)
                     .with_response_format(ManagerSelectionResponse)
-                    .with_max_tokens(4_000)
+                    .with_max_tokens(10_000)
                     .with_tools(agent_info.tools)  # for checking file existence
                 )
             elif agent_info.agent_name == "ResultGenerator":
@@ -208,7 +228,7 @@ class OrchestratorBase(AgentBase, Generic[TaskParamT, ResultT]):
                     agent_name=agent_info.agent_name,
                     step=self.step_name,
                 )
-                builder = builder.with_context_providers(memory_provider)
+                builder = builder.with_context_providers([memory_provider])
 
             agent = builder.build()
             agents[agent_info.agent_name] = agent
@@ -224,7 +244,7 @@ class OrchestratorBase(AgentBase, Generic[TaskParamT, ResultT]):
             return self._client_cache[thread_id]
         else:
             client = self.agent_framework_helper.create_client(
-                client_type=ClientType.AzureOpenAIResponseWithRetry,
+                client_type=ClientType.AzureOpenAIChatCompletionWithRetry,
                 endpoint=self.agent_framework_helper.settings.get_service_config(
                     "default"
                 ).endpoint,

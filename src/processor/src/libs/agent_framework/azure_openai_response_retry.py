@@ -6,13 +6,15 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
 import os
 import random
+import re
 from dataclasses import dataclass
-from typing import Any, AsyncIterable, MutableSequence
+from typing import Any, MutableSequence
 
-from agent_framework.azure import AzureOpenAIResponsesClient
+from agent_framework.openai import OpenAIChatClient, OpenAIChatCompletionClient
 from tenacity import (
     AsyncRetrying,
     retry_if_exception,
@@ -21,6 +23,168 @@ from tenacity import (
 from tenacity.wait import wait_base
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_tokens_from_dict_or_obj(ud: Any) -> tuple[int, int, int]:
+    """Extract (input, output, total) token counts from a dict or object."""
+    inp = out = tot = 0
+    if isinstance(ud, dict):
+        inp = ud.get("input_token_count", 0) or ud.get("input_tokens", 0) or 0
+        out = ud.get("output_token_count", 0) or ud.get("output_tokens", 0) or 0
+        tot = ud.get("total_token_count", 0) or ud.get("total_tokens", 0) or 0
+    else:
+        inp = getattr(ud, "input_token_count", 0) or getattr(ud, "input_tokens", 0) or 0
+        out = getattr(ud, "output_token_count", 0) or getattr(ud, "output_tokens", 0) or 0
+        tot = getattr(ud, "total_token_count", 0) or getattr(ud, "total_tokens", 0) or 0
+    if not tot:
+        tot = int(inp) + int(out)
+    return int(inp), int(out), int(tot)
+
+
+def _try_emit_token_event(inp: int, out: int, tot: int, source: str) -> None:
+    """Emit token usage found in a stream/response to App Insights.
+
+    The chat client retry wrapper is the only layer that reliably sees raw LLM
+    ``usage_details``; the orchestrator's streaming events and final conversation
+    do not surface usage Content. We therefore record here, against the active
+    ``TokenUsageTracker`` (resolved from context), which both aggregates the
+    usage and emits the per-call ``LLM_*`` Application Insights events. When no
+    tracker is active in the current context this falls back to a diagnostic log.
+    """
+    if not (tot > 0 or inp > 0 or out > 0):
+        return
+
+    logger.info(
+        "[TOKEN_STREAM] usage found: input=%s output=%s total=%s source=%s",
+        inp, out, tot, source,
+    )
+    try:
+        from utils.token_usage_tracker import record_usage_from_context
+
+        emitted = record_usage_from_context(
+            input_tokens=int(inp),
+            output_tokens=int(out),
+            total_tokens=int(tot),
+        )
+        if emitted:
+            logger.info(
+                "[TOKEN_STREAM] emitted LLM token event: total=%s source=%s",
+                tot, source,
+            )
+        else:
+            logger.warning(
+                "[TOKEN_STREAM] no active TokenUsageTracker in context; "
+                "token usage NOT emitted (total=%s source=%s)",
+                tot, source,
+            )
+    except Exception as e:
+        logger.warning(
+            "[TOKEN_STREAM] failed to emit token usage (source=%s): %s", source, e
+        )
+
+
+def _emit_usage_from_stream_item(item: Any) -> None:
+    """Check a streamed ChatResponseUpdate for usage Content and emit an App Insights event.
+
+    Checks multiple locations where usage data may appear:
+    1. item.contents[] with type="usage" and usage_details
+    2. item.usage (direct attribute - some SDK versions)
+    3. item.metadata with usage keys
+    """
+    try:
+        item_type = type(item).__name__
+
+        # --- Path 1: contents list with Content(type="usage") ---
+        contents = getattr(item, "contents", None)
+        if contents:
+            for content in contents:
+                ctype = getattr(content, "type", None)
+                if ctype == "usage":
+                    # SDK UsageContent uses "details"; fall back to "usage_details"
+                    ud = getattr(content, "details", None) or getattr(content, "usage_details", None)
+                    if ud:
+                        inp, out, tot = _extract_tokens_from_dict_or_obj(ud)
+                        _try_emit_token_event(inp, out, tot, "stream_contents")
+                        return
+
+        # --- Path 2: direct .usage attribute ---
+        usage = getattr(item, "usage", None)
+        if usage is not None:
+            inp, out, tot = _extract_tokens_from_dict_or_obj(usage)
+            _try_emit_token_event(inp, out, tot, "stream_usage_attr")
+            return
+
+        # --- Path 3: .metadata dict with usage keys ---
+        metadata = getattr(item, "metadata", None)
+        if isinstance(metadata, dict):
+            if any(k in metadata for k in ("input_tokens", "input_token_count", "usage")):
+                usage_data = metadata.get("usage", metadata)
+                inp, out, tot = _extract_tokens_from_dict_or_obj(usage_data)
+                _try_emit_token_event(inp, out, tot, "stream_metadata")
+                return
+
+        # --- Diagnostic: log item shape for debugging (only for non-text items) ---
+        if contents:
+            content_types = [getattr(c, "type", "?") for c in contents]
+            if any(t not in ("text",) for t in content_types):
+                logger.debug(
+                    "[TOKEN_DIAG] item_type=%s content_types=%s attrs=%s",
+                    item_type,
+                    content_types,
+                    [a for a in dir(item) if not a.startswith("_")],
+                )
+    except Exception as e:
+        logger.debug("[TOKEN_STREAM] error in emit: %s", e)
+
+
+def _emit_usage_from_response(response: Any) -> None:
+    """Extract and emit token usage from a non-streaming ChatResponse.
+
+    Checks usage_details (SDK attribute) and contents for UsageContent items.
+    """
+    try:
+        # Path 1: response.usage_details (ChatResponse from SDK)
+        ud = getattr(response, "usage_details", None) or getattr(response, "details", None)
+        if ud is not None:
+            inp, out, tot = _extract_tokens_from_dict_or_obj(ud)
+            _try_emit_token_event(inp, out, tot, "response_usage_details")
+            return
+
+        # Path 2: response.usage direct attribute
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            inp, out, tot = _extract_tokens_from_dict_or_obj(usage)
+            _try_emit_token_event(inp, out, tot, "response_usage_attr")
+            return
+
+        # Path 3: contents list with UsageContent
+        contents = getattr(response, "contents", None)
+        if contents:
+            for content in contents:
+                ctype = getattr(content, "type", None)
+                if ctype == "usage":
+                    ud = getattr(content, "details", None) or getattr(content, "usage_details", None)
+                    if ud:
+                        inp, out, tot = _extract_tokens_from_dict_or_obj(ud)
+                        _try_emit_token_event(inp, out, tot, "response_contents")
+                        return
+
+        # Path 4: messages list with usage content
+        messages = getattr(response, "messages", None)
+        if messages:
+            for msg in messages:
+                msg_contents = getattr(msg, "contents", None)
+                if not msg_contents:
+                    continue
+                for item in msg_contents:
+                    if getattr(item, "type", None) == "usage":
+                        ud = getattr(item, "details", None) or getattr(item, "usage_details", None)
+                        if ud:
+                            inp, out, tot = _extract_tokens_from_dict_or_obj(ud)
+                            _try_emit_token_event(inp, out, tot, "response_msg_contents")
+                            return
+    except Exception as e:
+        logger.debug("[TOKEN_RESPONSE] error in emit: %s", e)
 
 
 def _format_exc_brief(exc: BaseException) -> str:
@@ -80,9 +244,15 @@ def _looks_like_rate_limit(error: BaseException) -> bool:
 
     # "The model produced invalid content" is a transient error from Azure OpenAI
     # when the model output fails content/schema validation — worth retrying.
+    # "No tool call found" is a 400 error when the conversation has orphaned
+    # function call outputs with no matching tool call request.
     if any(
         s in msg
-        for s in ["model produced invalid content", "invalid content"]
+        for s in [
+            "model produced invalid content",
+            "invalid content",
+            "no tool call found",
+        ]
     ):
         return True
 
@@ -265,6 +435,87 @@ def _set_message_text(message: Any, new_text: str) -> Any:
     return message
 
 
+# OpenAI Chat Completions requires message `name` to match this pattern:
+#   ^[^\s<|\\/>]+$
+# Agent display names like "Chief Architect" contain spaces and are rejected.
+# We replace any run of disallowed characters with a single underscore so the
+# wire-format passes validation while preserving readability.
+_OPENAI_NAME_INVALID_CHARS = re.compile(r"[\s<|\\/>]+")
+
+
+def _sanitize_author_name(name: Any) -> Any:
+    """Sanitize a single author_name for OpenAI Chat Completions.
+
+    Returns the original value when it is not a string, is empty, or is already
+    valid. Otherwise returns a string with disallowed characters collapsed to
+    underscores and surrounding underscores stripped. If the result would be
+    empty (e.g. name was all whitespace), returns ``None`` so the field can be
+    dropped entirely.
+    """
+    if not isinstance(name, str):
+        return name
+    if not name:
+        return None
+    if not _OPENAI_NAME_INVALID_CHARS.search(name):
+        return name
+    sanitized = _OPENAI_NAME_INVALID_CHARS.sub("_", name).strip("_")
+    return sanitized or None
+
+
+def _sanitize_author_names(
+    messages: MutableSequence[Any],
+) -> MutableSequence[Any] | list[Any]:
+    """Return ``messages`` with each entry's author_name sanitized.
+
+    - For dict-shaped messages, the ``name`` key is rewritten on a shallow copy
+      (and removed if the sanitized value would be empty).
+    - For ``agent_framework.Message``-like objects, ``author_name`` is rewritten
+      on a shallow copy so the originals (which may live in long-lived agent
+      state) are not mutated.
+    - Messages that don't need sanitization are returned unchanged. If nothing
+      needed sanitization the original sequence is returned as-is.
+    """
+    out: list[Any] = []
+    any_changed = False
+    for m in messages:
+        # Dict form: {"role": ..., "name": ..., "content": ...}
+        if isinstance(m, dict):
+            name = m.get("name")
+            if isinstance(name, str):
+                sanitized = _sanitize_author_name(name)
+                if sanitized != name:
+                    new_m = dict(m)
+                    if sanitized:
+                        new_m["name"] = sanitized
+                    else:
+                        new_m.pop("name", None)
+                    out.append(new_m)
+                    any_changed = True
+                    continue
+            out.append(m)
+            continue
+
+        # Object form (agent_framework Message): has .author_name attribute.
+        name = getattr(m, "author_name", None)
+        if isinstance(name, str):
+            sanitized = _sanitize_author_name(name)
+            if sanitized != name:
+                try:
+                    new_m = copy.copy(m)
+                    new_m.author_name = sanitized
+                    out.append(new_m)
+                    any_changed = True
+                    continue
+                except Exception:
+                    # Last-resort in-place fallback if copy/setattr is blocked.
+                    try:
+                        m.author_name = sanitized
+                    except Exception:
+                        pass
+        out.append(m)
+    return out if any_changed else messages
+
+
 @dataclass(frozen=True)
 class ContextTrimConfig:
     """Character-budget based context trimming.
@@ -391,13 +642,14 @@ def _trim_messages(
     def _total_chars(msgs: list[Any]) -> int:
         return sum(len(_estimate_message_text(x)) for x in msgs)
 
-    while combined and _total_chars(combined) > cfg.max_total_chars:
+    while len(combined) > 1 and _total_chars(combined) > cfg.max_total_chars:
         # Prefer dropping earliest non-system message.
+        # Never drop the last message — the model needs at least one.
         drop_index = 0
         if cfg.keep_system_messages and system_messages:
             drop_index = len(system_messages)
-        if drop_index >= len(combined):
-            # If only system messages remain, truncate the last one.
+        if drop_index >= len(combined) - 1:
+            # Only system messages (+ maybe 1 non-system) remain — truncate the last one.
             last = combined[-1]
             text = _estimate_message_text(last)
             text = _truncate_text(
@@ -513,11 +765,11 @@ async def _retry_call(coro_factory, *, config: RateLimitRetryConfig):
     raise RuntimeError("Retry loop exhausted unexpectedly")
 
 
-class AzureOpenAIResponseClientWithRetry(AzureOpenAIResponsesClient):
+class AzureOpenAIResponseClientWithRetry(OpenAIChatClient):
     """Azure OpenAI Responses client with 429 retry at the request boundary.
 
     Retry is centralized in the client layer (not in orchestrators) by retrying the
-    underlying Responses calls made by `OpenAIBaseResponsesClient`.
+    underlying Responses calls made by `OpenAIChatClient`.
     """
 
     def __init__(
@@ -530,38 +782,96 @@ class AzureOpenAIResponseClientWithRetry(AzureOpenAIResponsesClient):
         self._retry_config = retry_config or RateLimitRetryConfig.from_env()
         self._context_trim_config = ContextTrimConfig.from_env()
 
-    async def _inner_get_response(
-        self, *, messages: MutableSequence[Any], chat_options: Any, **kwargs: Any
+    def _inner_get_response(
+        self, *, messages: MutableSequence[Any], options: Any = None, stream: bool = False, **kwargs: Any
     ) -> Any:
-        parent_inner_get_response = super(
+        """Override that adds retry + context-trimming around the parent call.
+
+        Must remain a regular ``def`` (not ``async def``) because the parent
+        returns different types depending on *stream*:
+        - stream=False → Awaitable[ChatResponse]
+        - stream=True  → ResponseStream  (AsyncIterable)
+        """
+        effective_messages = self._maybe_trim_messages(messages)
+
+        if not effective_messages:
+            # Empty inputs occur legitimately in group-chat orchestration when the
+            # same speaker is selected twice in a row (the orchestrator's broadcast
+            # excludes the source). The parent client's `_prepare_options` still
+            # prepends the agent's system instructions, so the API call has content.
+            logger.debug(
+                "[AOAI_RETRY] empty messages list received; relying on options.instructions"
+            )
+            effective_messages = messages
+
+        if stream:
+            # For streaming, delegate to the parent which returns a proper
+            # ResponseStream. The framework checks isinstance(result, ResponseStream)
+            # and async generators fail that check.
+            parent_inner = super(
+                AzureOpenAIResponseClientWithRetry, self
+            )._inner_get_response
+            return parent_inner(
+                messages=effective_messages, options=options, stream=True, **kwargs
+            )
+        else:
+            return self._non_streaming_with_retry(
+                effective_messages=effective_messages,
+                original_messages=messages,
+                options=options,
+                **kwargs,
+            )
+
+    def _maybe_trim_messages(
+        self, messages: MutableSequence[Any]
+    ) -> MutableSequence[Any] | list[Any]:
+        """Apply pre-call context trimming if enabled and over budget."""
+        if not self._context_trim_config.enabled:
+            return messages
+        approx_chars = sum(len(_estimate_message_text(m)) for m in messages)
+        if (
+            self._context_trim_config.max_total_chars > 0
+            and approx_chars > self._context_trim_config.max_total_chars
+        ):
+            trimmed = _trim_messages(messages, cfg=self._context_trim_config)
+            if not trimmed:
+                logger.warning(
+                    "[AOAI_CTX_TRIM] trimming would remove all messages; keeping originals"
+                )
+                return messages
+            logger.warning(
+                "[AOAI_CTX_TRIM] pre-trimmed request messages: approx_chars=%s -> %s; count=%s -> %s",
+                approx_chars,
+                sum(len(_estimate_message_text(m)) for m in trimmed),
+                len(messages),
+                len(trimmed),
+            )
+            return trimmed
+        return messages
+
+    async def _non_streaming_with_retry(
+        self,
+        *,
+        effective_messages: MutableSequence[Any] | list[Any],
+        original_messages: MutableSequence[Any],
+        options: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Non-streaming path: full retry + context-trim fallback."""
+        parent_inner = super(
             AzureOpenAIResponseClientWithRetry, self
         )._inner_get_response
 
-        effective_messages: MutableSequence[Any] | list[Any] = messages
-        if self._context_trim_config.enabled:
-            approx_chars = sum(len(_estimate_message_text(m)) for m in messages)
-            if (
-                self._context_trim_config.max_total_chars > 0
-                and approx_chars > self._context_trim_config.max_total_chars
-            ):
-                effective_messages = _trim_messages(
-                    messages, cfg=self._context_trim_config
-                )
-                logger.warning(
-                    "[AOAI_CTX_TRIM] pre-trimmed request messages: approx_chars=%s -> %s; count=%s -> %s",
-                    approx_chars,
-                    sum(len(_estimate_message_text(m)) for m in effective_messages),
-                    len(messages),
-                    len(effective_messages),
-                )
-
         try:
-            return await _retry_call(
-                lambda: parent_inner_get_response(
-                    messages=effective_messages, chat_options=chat_options, **kwargs
+            response = await _retry_call(
+                lambda: parent_inner(
+                    messages=effective_messages, options=options, stream=False, **kwargs
                 ),
                 config=self._retry_config,
             )
+            # Extract and emit token usage from non-streaming response
+            _emit_usage_from_response(response)
+            return response
         except Exception as e:
             if not (
                 self._context_trim_config.enabled
@@ -571,7 +881,7 @@ class AzureOpenAIResponseClientWithRetry(AzureOpenAIResponsesClient):
                 raise
 
             trimmed = _trim_messages(
-                messages,
+                original_messages,
                 cfg=ContextTrimConfig(
                     enabled=True,
                     max_total_chars=max(
@@ -591,168 +901,254 @@ class AzureOpenAIResponseClientWithRetry(AzureOpenAIResponsesClient):
                     retry_on_context_error=True,
                 ),
             )
+            if not trimmed:
+                logger.warning(
+                    "[AOAI_CTX_TRIM] aggressive trim would remove all messages; re-raising original error"
+                )
+                raise
             logger.warning(
                 "[AOAI_CTX_TRIM] retrying after context-length error; count=%s -> %s",
-                len(messages),
+                len(original_messages),
                 len(trimmed),
             )
-            # Cool down before retrying to avoid triggering 429s immediately.
-            trim_delay = self._retry_config.base_delay_seconds
-            trim_delay = min(trim_delay, self._retry_config.max_delay_seconds)
+            trim_delay = min(
+                self._retry_config.base_delay_seconds,
+                self._retry_config.max_delay_seconds,
+            )
             logger.info(
-                "[AOAI_CTX_TRIM] sleeping %ss before retry",
-                round(trim_delay, 1),
+                "[AOAI_CTX_TRIM] sleeping %ss before retry", round(trim_delay, 1)
             )
             await asyncio.sleep(trim_delay)
-            return await _retry_call(
-                lambda: parent_inner_get_response(
-                    messages=trimmed, chat_options=chat_options, **kwargs
+            response = await _retry_call(
+                lambda: parent_inner(
+                    messages=trimmed, options=options, stream=False, **kwargs
                 ),
                 config=self._retry_config,
             )
+            # Emit token usage from the retried (context-trimmed) response too.
+            _emit_usage_from_response(response)
+            return response
 
-    async def _inner_get_streaming_response(
-        self, *, messages: MutableSequence[Any], chat_options: Any, **kwargs: Any
-    ) -> AsyncIterable[Any]:
-        # Conservative retry: only retries failures before the first yielded update.
-        attempts = self._retry_config.max_retries + 1
 
-        effective_messages: MutableSequence[Any] | list[Any] = messages
-        if self._context_trim_config.enabled:
-            approx_chars = sum(len(_estimate_message_text(m)) for m in messages)
-            if (
-                self._context_trim_config.max_total_chars > 0
-                and approx_chars > self._context_trim_config.max_total_chars
-            ):
-                effective_messages = _trim_messages(
-                    messages, cfg=self._context_trim_config
-                )
-                logger.warning(
-                    "[AOAI_CTX_TRIM] pre-trimmed streaming request messages: approx_chars=%s -> %s; count=%s -> %s",
-                    approx_chars,
-                    sum(len(_estimate_message_text(m)) for m in effective_messages),
-                    len(messages),
-                    len(effective_messages),
-                )
+class AzureOpenAIChatClientWithRetry(OpenAIChatCompletionClient):
+    """Azure OpenAI Chat (Chat Completions) client with 429 retry at the request boundary.
 
-        for attempt_index in range(attempts):
-            stream = super(
-                AzureOpenAIResponseClientWithRetry, self
-            )._inner_get_streaming_response(
-                messages=effective_messages, chat_options=chat_options, **kwargs
+    Wraps the ``/chat/completions`` endpoint used by Agent Framework by overriding
+    the internal ``_inner_get_response`` method. This client works with all Azure
+    OpenAI API versions including ``2025-03-01-preview``.
+
+    Use this in preference to ``AzureOpenAIResponseClientWithRetry`` when the
+    ``/responses`` endpoint (and the ``v1`` API version it requires) is not
+    available in the target Azure OpenAI resource.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        retry_config: RateLimitRetryConfig | None = None,
+        **kwargs: Any,
+    ):
+        super().__init__(*args, **kwargs)
+        self._retry_config = retry_config or RateLimitRetryConfig.from_env()
+        self._context_trim_config = ContextTrimConfig.from_env()
+
+    def _inner_get_response(
+        self, *, messages: MutableSequence[Any], options: Any = None, stream: bool = False, **kwargs: Any
+    ) -> Any:
+        """Override that adds retry + context-trimming around the parent call.
+
+        Must remain a regular ``def`` (not ``async def``) because the parent
+        returns different types depending on *stream*:
+        - stream=False → Awaitable[ChatResponse]
+        - stream=True  → ResponseStream  (AsyncIterable)
+        """
+        effective_messages = self._maybe_trim_messages(messages)
+
+        if not effective_messages:
+            # Empty inputs occur legitimately in group-chat orchestration when the
+            # same speaker is selected twice in a row (the orchestrator's broadcast
+            # excludes the source). The parent client's `_prepare_options` still
+            # prepends the agent's system instructions, so the API call has content.
+            logger.debug(
+                "[AOAI_RETRY] empty messages list received; relying on options.instructions"
+            )
+            effective_messages = messages
+
+        # OpenAI Chat Completions validates message `name` against ^[^\s<|\\/>]+$.
+        # Sanitize before sending so agent display names like "Chief Architect"
+        # don't trip a 400 BadRequest. Originals are shallow-copied, not mutated.
+        # NOTE: this is a defense-in-depth pass on ``Message.author_name``.
+        # The authoritative sanitization happens in ``_prepare_messages_for_openai``
+        # below, which sanitizes the FINAL dict ``name`` field right before the
+        # request is sent — catching any name that slips in via framework-internal
+        # message construction (e.g. compaction, memory context providers,
+        # orchestrator-injected messages) that bypasses this early pass.
+        effective_messages = _sanitize_author_names(effective_messages)
+
+        if stream:
+            # For streaming, delegate to the parent which returns a proper
+            # ResponseStream. The framework checks isinstance(result, ResponseStream)
+            # and async generators fail that check.
+            parent_inner = super(
+                AzureOpenAIChatClientWithRetry, self
+            )._inner_get_response
+            return parent_inner(
+                messages=effective_messages, options=options, stream=True, **kwargs
+            )
+        else:
+            return self._non_streaming_with_retry(
+                effective_messages=effective_messages,
+                original_messages=messages,
+                options=options,
+                **kwargs,
             )
 
-            iterator = stream.__aiter__()
-            try:
-                first = await iterator.__anext__()
+    def _prepare_messages_for_openai(self, chat_messages, *args: Any, **kwargs: Any):  # type: ignore[override]
+        """Sanitize message ``name`` fields after framework conversion to wire format.
 
-                async def _tail():
-                    yield first
-                    async for item in iterator:
-                        yield item
+        The parent ``_prepare_messages_for_openai`` walks ``Message`` objects and
+        builds the OpenAI dict payload (``{"role": ..., "name": ..., "content": ...}``).
+        The ``name`` field is copied from ``Message.author_name`` and is validated
+        by the OpenAI Chat Completions API against ``^[^\\s<|\\\\/>]+$``.
 
-                async for item in _tail():
-                    yield item
-                return
-            except StopAsyncIteration:
-                return
-            except Exception as e:
-                close = getattr(stream, "aclose", None)
-                if callable(close):
-                    try:
-                        await close()
-                    except Exception:
-                        logger.debug("Best-effort close of response stream failed", exc_info=True)
+        We override here as a final, authoritative sanitization point. Even though
+        ``_inner_get_response`` already sanitizes ``Message.author_name``, names
+        can still reach this layer unsanitized from:
 
-                # Progressive retry for context-length failures.
-                if (
-                    self._context_trim_config.enabled
-                    and self._context_trim_config.retry_on_context_error
-                    and _looks_like_context_length(e)
-                ):
-                    # Make trimming progressively more aggressive on each retry
-                    # GPT-5.1: 272K input tokens ≈ 800K chars. Scale down from 600K default.
-                    scale = attempt_index + 1
-                    aggressive_cfg = ContextTrimConfig(
-                        enabled=True,
-                        max_total_chars=max(
-                            30_000,
-                            self._context_trim_config.max_total_chars - scale * 100_000,
-                        ),
-                        max_message_chars=max(
-                            2_000,
-                            self._context_trim_config.max_message_chars - scale * 8_000,
-                        ),
-                        keep_last_messages=max(
-                            4,
-                            self._context_trim_config.keep_last_messages - scale * 8,
-                        ),
-                        keep_head_chars=max(
-                            500,
-                            self._context_trim_config.keep_head_chars - scale * 3_000,
-                        ),
-                        keep_tail_chars=max(
-                            500,
-                            self._context_trim_config.keep_tail_chars - scale * 1_000,
-                        ),
-                        keep_system_messages=True,
-                        retry_on_context_error=True,
-                    )
-                    trimmed = _trim_messages(effective_messages, cfg=aggressive_cfg)
-                    logger.warning(
-                        "[AOAI_CTX_TRIM_STREAM] retrying after context-length error (attempt %s); count=%s -> %s, budget=%s",
-                        attempt_index + 1,
-                        len(effective_messages),
-                        len(trimmed),
-                        aggressive_cfg.max_total_chars,
-                    )
-                    effective_messages = trimmed
-                    if attempt_index >= attempts - 1:
-                        # No more retries available.
-                        raise
+        * ``OpenAIChatCompletionClient._prepare_options`` calling
+          ``prepend_instructions_to_messages`` (which does not author_name, but
+          downstream callers may add named messages).
+        * ``ChatAgent`` / memory context providers materializing messages with
+          ``author_name`` set inside the agent run loop, after the client receives
+          the original sequence.
+        * Any framework-internal compaction or message-rewriting path that
+          constructs new ``Message`` objects.
 
-                    # Cool down before retrying — immediate retries after trimming
-                    # tend to trigger 429s because the API hasn't recovered yet.
-                    trim_delay = self._retry_config.base_delay_seconds * (
-                        2**attempt_index
-                    )
-                    trim_delay = min(trim_delay, self._retry_config.max_delay_seconds)
-                    logger.info(
-                        "[AOAI_CTX_TRIM_STREAM] sleeping %ss before retry",
-                        round(trim_delay, 1),
-                    )
-                    await asyncio.sleep(trim_delay)
-                    continue
+        Sanitizing the dict output is the single chokepoint guaranteed to be
+        on every Chat Completions request, regardless of how the messages were
+        assembled upstream.
+        """
+        result = super()._prepare_messages_for_openai(chat_messages, *args, **kwargs)
+        for msg in result:
+            if not isinstance(msg, dict):
+                continue
+            name = msg.get("name")
+            if not isinstance(name, str):
+                continue
+            sanitized = _sanitize_author_name(name)
+            if sanitized == name:
+                continue
+            if sanitized:
+                msg["name"] = sanitized
+            else:
+                msg.pop("name", None)
+        return result
 
-                if not _looks_like_rate_limit(e) or attempt_index >= attempts - 1:
-                    if _looks_like_rate_limit(e):
-                        logger.warning(
-                            "[AOAI_RETRY_STREAM] giving up after %s/%s attempts; error=%s",
-                            attempt_index + 1,
-                            attempts,
-                            _format_exc_brief(e)
-                            if isinstance(e, BaseException)
-                            else str(e),
-                        )
-                    raise
-
-                retry_after = _try_get_retry_after_seconds(e)
-                if retry_after is not None and retry_after >= 0:
-                    delay = retry_after
-                else:
-                    delay = self._retry_config.base_delay_seconds * (2**attempt_index)
-                    delay = min(delay, self._retry_config.max_delay_seconds)
-                    delay = delay + random.uniform(0.0, 0.25 * max(delay, 0.1))
-
-                status = getattr(e, "status_code", None) or getattr(e, "status", None)
+    def _maybe_trim_messages(
+        self, messages: MutableSequence[Any]
+    ) -> MutableSequence[Any] | list[Any]:
+        """Apply pre-call context trimming if enabled and over budget."""
+        if not self._context_trim_config.enabled:
+            return messages
+        approx_chars = sum(len(_estimate_message_text(m)) for m in messages)
+        if (
+            self._context_trim_config.max_total_chars > 0
+            and approx_chars > self._context_trim_config.max_total_chars
+        ):
+            trimmed = _trim_messages(messages, cfg=self._context_trim_config)
+            if not trimmed:
                 logger.warning(
-                    "[AOAI_RETRY_STREAM] attempt %s/%s; sleeping=%ss; retry_after=%s; status=%s; error=%s",
-                    attempt_index + 1,
-                    attempts,
-                    round(float(delay), 3),
-                    None if retry_after is None else round(float(retry_after), 3),
-                    status,
-                    _format_exc_brief(e) if isinstance(e, BaseException) else str(e),
+                    "[AOAI_CTX_TRIM] trimming would remove all messages; keeping originals"
                 )
+                return messages
+            logger.warning(
+                "[AOAI_CTX_TRIM] pre-trimmed chat request messages: approx_chars=%s -> %s; count=%s -> %s",
+                approx_chars,
+                sum(len(_estimate_message_text(m)) for m in trimmed),
+                len(messages),
+                len(trimmed),
+            )
+            return trimmed
+        return messages
 
-                await asyncio.sleep(delay)
+    async def _non_streaming_with_retry(
+        self,
+        *,
+        effective_messages: MutableSequence[Any] | list[Any],
+        original_messages: MutableSequence[Any],
+        options: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Non-streaming path: full retry + context-trim fallback."""
+        parent_inner = super(
+            AzureOpenAIChatClientWithRetry, self
+        )._inner_get_response
+
+        try:
+            response = await _retry_call(
+                lambda: parent_inner(
+                    messages=effective_messages, options=options, stream=False, **kwargs
+                ),
+                config=self._retry_config,
+            )
+            # Extract and emit token usage from the non-streaming response.
+            _emit_usage_from_response(response)
+            return response
+        except Exception as e:
+            if not (
+                self._context_trim_config.enabled
+                and self._context_trim_config.retry_on_context_error
+                and _looks_like_context_length(e)
+            ):
+                raise
+
+            trimmed = _trim_messages(
+                original_messages,
+                cfg=ContextTrimConfig(
+                    enabled=True,
+                    max_total_chars=max(
+                        50_000, self._context_trim_config.max_total_chars - 80_000
+                    ),
+                    max_message_chars=max(
+                        3_000, self._context_trim_config.max_message_chars - 6_000
+                    ),
+                    keep_last_messages=max(
+                        6, self._context_trim_config.keep_last_messages - 12
+                    ),
+                    keep_head_chars=max(
+                        1_000, self._context_trim_config.keep_head_chars - 4_000
+                    ),
+                    keep_tail_chars=self._context_trim_config.keep_tail_chars,
+                    keep_system_messages=True,
+                    retry_on_context_error=True,
+                ),
+            )
+            if not trimmed:
+                logger.warning(
+                    "[AOAI_CTX_TRIM] aggressive trim would remove all messages; re-raising original error"
+                )
+                raise
+            logger.warning(
+                "[AOAI_CTX_TRIM] retrying chat after context-length error; count=%s -> %s",
+                len(original_messages),
+                len(trimmed),
+            )
+            # Re-sanitize names on the freshly-trimmed messages before retry.
+            trimmed = _sanitize_author_names(trimmed)
+            trim_delay = min(
+                self._retry_config.base_delay_seconds,
+                self._retry_config.max_delay_seconds,
+            )
+            logger.info(
+                "[AOAI_CTX_TRIM] sleeping %ss before retry", round(trim_delay, 1)
+            )
+            await asyncio.sleep(trim_delay)
+            response = await _retry_call(
+                lambda: parent_inner(
+                    messages=trimmed, options=options, stream=False, **kwargs
+                ),
+                config=self._retry_config,
+            )
+            # Emit token usage from the retried (context-trimmed) response too.
+            _emit_usage_from_response(response)
+            return response

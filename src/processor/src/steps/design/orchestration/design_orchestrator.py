@@ -14,7 +14,6 @@ from typing import Any, Callable, MutableMapping, Sequence
 from agent_framework import (
     MCPStdioTool,
     MCPStreamableHTTPTool,
-    ToolProtocol,
 )
 
 from libs.agent_framework.agent_info import AgentInfo
@@ -84,6 +83,7 @@ class DesignOrchestrator(
                 participants=self.agents,
                 memory_client=None,
                 result_output_format=Design_ExtendedBooleanResult,
+                token_usage_tracker=self.token_tracker,
             )
 
             orchestration_result = await orchestrator.run_stream(
@@ -98,10 +98,10 @@ class DesignOrchestrator(
     async def prepare_mcp_tools(
         self,
     ) -> (
-        ToolProtocol
+        Any
         | Callable[..., Any]
         | MutableMapping[str, Any]
-        | Sequence[ToolProtocol | Callable[..., Any] | MutableMapping[str, Any]]
+        | Sequence[Any | Callable[..., Any] | MutableMapping[str, Any]]
     ):
         """Create and return the MCP tools used by design agents."""
         # Create MCP tools (not connected yet)

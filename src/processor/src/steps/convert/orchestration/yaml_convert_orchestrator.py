@@ -16,7 +16,6 @@ from typing import Any, Callable, MutableMapping, Sequence
 from agent_framework import (
     MCPStdioTool,
     MCPStreamableHTTPTool,
-    ToolProtocol,
 )
 
 from libs.agent_framework.agent_info import AgentInfo
@@ -93,6 +92,7 @@ class YamlConvertOrchestrator(
                 memory_client=None,
                 max_seconds=900,
                 result_output_format=Yaml_ExtendedBooleanResult,
+                token_usage_tracker=self.token_tracker,
             )
 
             orchestration_result = await orchestrator.run_stream(
@@ -107,10 +107,10 @@ class YamlConvertOrchestrator(
     async def prepare_mcp_tools(
         self,
     ) -> (
-        ToolProtocol
+        Any
         | Callable[..., Any]
         | MutableMapping[str, Any]
-        | Sequence[ToolProtocol | Callable[..., Any] | MutableMapping[str, Any]]
+        | Sequence[Any | Callable[..., Any] | MutableMapping[str, Any]]
     ):
         """Create and return the MCP tools used by conversion agents."""
         ms_doc_mcp_tool = MCPStreamableHTTPTool(
